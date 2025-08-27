@@ -4,14 +4,17 @@ WORKDIR /build
 
 # Install dependencies first to leverage Docker layer cache
 COPY hajimiUI/package*.json ./hajimiUI/
-RUN cd hajimiUI && npm ci --no-audit --no-fund
+# If package-lock.json is absent, fall back to npm install
+RUN set -eux; \
+    cd hajimiUI; \
+    (npm ci --no-audit --no-fund || npm install --no-audit --no-fund)
 
 # Copy sources required for the UI build (the build writes into ../app/templates)
 COPY hajimiUI ./hajimiUI
 COPY app ./app
 
 # Build the UI assets into app/templates
-RUN cd hajimiUI && npm run build:app
+RUN set -eux; cd hajimiUI; npm run build:app
 
 
 # --- Stage 2: Runtime image ---
