@@ -153,6 +153,87 @@ class GeminiClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
+    def _build_socks5_proxy_url(self) -> str | None:
+        """构建 SOCKS5 代理 URL 字符串，例如 socks5://user:pass@host:port"""
+        if not settings.PROXY_SOCKS5_ENABLED:
+            return None
+        host = (settings.PROXY_SOCKS5_HOST or '').strip()
+        port = int(settings.PROXY_SOCKS5_PORT or 0)
+        if not host or port <= 0:
+            return None
+        user = (settings.PROXY_SOCKS5_USERNAME or '').strip()
+        pwd = (settings.PROXY_SOCKS5_PASSWORD or '')
+        if user and pwd:
+            auth = f"{user}:{pwd}@"
+        elif user and not pwd:
+            auth = f"{user}:@"
+        else:
+            auth = ""
+        # 使用 socks5h，确保 DNS 解析在代理端进行
+        return f"socks5h://{auth}{host}:{port}"
+
+    def _create_async_client(self):
+        """
+        尝试带本地 proxies 参数创建 httpx.AsyncClient；
+        如果安装的 httpx 版本不支持 proxies 形参，则回退到环境变量方式。
+        """
+        proxy_url = self._build_socks5_proxy_url()
+        def _mask(url: str) -> str:
+            try:
+                if '://' in url and '@' in url:
+                    scheme, rest = url.split('://', 1)
+                    cred_host = rest.split('@', 1)
+                    if len(cred_host) == 2:
+                        userpass, hostpart = cred_host
+                        user = userpass.split(':', 1)[0]
+                        return f"{scheme}://{user}:******@{hostpart}"
+            except Exception:
+                pass
+            return url
+
+        if proxy_url:
+            try:
+                # 使用 httpx 标准的代理键，确保同时作用于 http 和 https
+                client = httpx.AsyncClient(
+                    proxies={
+                        "all://": proxy_url,
+                        "http://": proxy_url,
+                        "https://": proxy_url,
+                    },
+                    trust_env=False,
+                )
+                meta = {
+                    "proxy_enabled": True,
+                    "proxy_mode": "proxies_param",
+                    "proxy_url_masked": _mask(proxy_url),
+                }
+                return client, meta
+            except TypeError:
+                # 回退：通过环境变量提供代理（覆盖所有相关变量，避免被系统/其他变量抢优先级）
+                old_env = {
+                    "ALL_PROXY": os.environ.get("ALL_PROXY"),
+                    "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+                    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+                    "NO_PROXY": os.environ.get("NO_PROXY"),
+                }
+                os.environ["ALL_PROXY"] = proxy_url
+                os.environ["HTTP_PROXY"] = proxy_url
+                os.environ["HTTPS_PROXY"] = proxy_url
+                # 禁用直连白名单，确保 Gemini 域名不会被绕过代理
+                os.environ.pop("NO_PROXY", None)
+                client = httpx.AsyncClient(trust_env=True)
+                meta = {
+                    "proxy_enabled": True,
+                    "proxy_mode": "env_fallback",
+                    "proxy_url_masked": _mask(proxy_url),
+                    "_old_env": old_env,
+                }
+                return client, meta
+        # 无代理
+        client = httpx.AsyncClient(trust_env=False)
+        meta = {"proxy_enabled": False, "proxy_mode": "disabled"}
+        return client, meta
+
     # 请求参数处理
     def _convert_request_data(
         self, request, contents, safety_settings, system_instruction
@@ -310,46 +391,75 @@ class GeminiClient:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST", url, headers=headers, json=data, timeout=600
-            ) as response:
-                try:
-                    # 检查响应状态码，如果不是成功，则先消费响应体再抛出异常
-                    if response.status_code != 200:
-                        await response.aread()
-                        response.raise_for_status()
+        client, meta = self._create_async_client()
+        log(
+            "info",
+            (
+                f"准备发起Gemini流式请求 "
+                f"request_url={url} "
+                f"proxy_enabled={meta.get('proxy_enabled')} "
+                f"proxy_mode={meta.get('proxy_mode')} "
+                f"proxy_url={meta.get('proxy_url_masked', '')}"
+            ),
+            extra={"request_url": url, **meta},
+        )
+        try:
+            async with client as client:
+                async with client.stream(
+                    "POST", url, headers=headers, json=data, timeout=600
+                ) as response:
+                    try:
+                        # 检查响应状态码，如果不是成功，则先消费响应体再抛出异常
+                        if response.status_code != 200:
+                            await response.aread()
+                            response.raise_for_status()
 
-                    buffer = b""  # 用于累积可能不完整的 JSON 数据
-                    async for line in response.aiter_lines():
-                        if not line.strip():  # 跳过空行 (SSE 消息分隔符)
-                            continue
-                        if line.startswith("data: "):
-                            line = line[len("data: ") :].strip()  # 去除 "data: " 前缀
+                        buffer = b""  # 用于累积可能不完整的 JSON 数据
+                        async for line in response.aiter_lines():
+                            if not line.strip():  # 跳过空行 (SSE 消息分隔符)
+                                continue
+                            if line.startswith("data: "):
+                                line = line[len("data: ") :].strip()  # 去除 "data: " 前缀
 
-                        # 检查是否是结束标志，如果是，结束循环
-                        if line == "[DONE]":
-                            break
+                            # 检查是否是结束标志，如果是，结束循环
+                            if line == "[DONE]":
+                                break
 
-                        buffer += line.encode("utf-8")
-                        try:
-                            # 尝试解析整个缓冲区
-                            data = json.loads(buffer.decode("utf-8"))
-                            # 解析成功，清空缓冲区
-                            buffer = b""
-                            yield GeminiResponseWrapper(data)
+                            buffer += line.encode("utf-8")
+                            try:
+                                # 尝试解析整个缓冲区
+                                data = json.loads(buffer.decode("utf-8"))
+                                # 解析成功，清空缓冲区
+                                buffer = b""
+                                yield GeminiResponseWrapper(data)
 
-                        except json.JSONDecodeError:
-                            # JSON 不完整，继续累积到 buffer
-                            continue
+                            except json.JSONDecodeError:
+                                # JSON 不完整，继续累积到 buffer
+                                continue
 
-                except Exception as e:
-                    # 在重新抛出异常之前，确保响应体被完全读取
-                    if not response.is_closed:
-                        await response.aread()
-                    raise e
-                finally:
-                    log("info", "流式请求结束")
+                    except Exception as e:
+                        # 在重新抛出异常之前，确保响应体被完全读取
+                        if not response.is_closed:
+                            await response.aread()
+                        raise e
+                    finally:
+                        log("info", "流式请求结束")
+        finally:
+            # 还原环境变量
+            if meta.get("proxy_mode") == "env_fallback":
+                old_env = meta.get("_old_env", {})
+                # 逐项恢复环境变量
+                for k in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
+                    old_val = old_env.get(k)
+                    if old_val is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = old_val
+                # 恢复 NO_PROXY
+                if old_env.get("NO_PROXY") is None:
+                    os.environ.pop("NO_PROXY", None)
+                else:
+                    os.environ["NO_PROXY"] = old_env.get("NO_PROXY")
 
     # 非流式处理
     async def complete_chat(
@@ -365,15 +475,39 @@ class GeminiClient:
         }
 
         try:
-            async with httpx.AsyncClient() as client:
+            client, meta = self._create_async_client()
+            log(
+                "info",
+                (
+                    f"准备发起Gemini非流式请求 "
+                    f"request_url={url} "
+                    f"proxy_enabled={meta.get('proxy_enabled')} "
+                    f"proxy_mode={meta.get('proxy_mode')} "
+                    f"proxy_url={meta.get('proxy_url_masked', '')}"
+                ),
+                extra={"request_url": url, **meta},
+            )
+            async with client as client:
                 response = await client.post(
                     url, headers=headers, json=data, timeout=600
                 )
                 response.raise_for_status()  # 检查 HTTP 错误状态
-
-            return GeminiResponseWrapper(response.json())
+                return GeminiResponseWrapper(response.json())
         except Exception:
             raise
+        finally:
+            if meta.get("proxy_mode") == "env_fallback":
+                old_env = meta.get("_old_env", {})
+                for k in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
+                    old_val = old_env.get(k)
+                    if old_val is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = old_val
+                if old_env.get("NO_PROXY") is None:
+                    os.environ.pop("NO_PROXY", None)
+                else:
+                    os.environ["NO_PROXY"] = old_env.get("NO_PROXY")
 
     # OpenAI 格式请求转换为 gemini 格式请求
     def convert_messages(self, messages, use_system_prompt=False, model=None):
@@ -539,10 +673,31 @@ class GeminiClient:
         url = "https://generativelanguage.googleapis.com/v1beta/models?key={}".format(
             api_key
         )
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
+        # 通过实例创建带代理的 client，并记录日志
+        _inst = GeminiClient("")
+        client, meta = _inst._create_async_client()
+        log(
+            "info",
+            (
+                f"准备查询可用模型 request_url={url} "
+                f"proxy_enabled={meta.get('proxy_enabled')} "
+                f"proxy_mode={meta.get('proxy_mode')} "
+                f"proxy_url={meta.get('proxy_url_masked', '')}"
+            ),
+            extra={"request_url": url, **meta},
+        )
+        try:
+            async with client as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+        finally:
+            if meta.get("proxy_mode") == "env_fallback":
+                old = meta.get("_old_all_proxy")
+                if old is None:
+                    os.environ.pop("ALL_PROXY", None)
+                else:
+                    os.environ["ALL_PROXY"] = old
             models = []
             for model in data.get("models", []):
                 models.append(model["name"])
@@ -563,7 +718,27 @@ class GeminiClient:
         url = "https://generativelanguage.googleapis.com/v1beta/models?key={}".format(
             api_key
         )
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
+        _inst = GeminiClient("")
+        client, meta = _inst._create_async_client()
+        log(
+            "info",
+            (
+                f"准备查询原生模型 request_url={url} "
+                f"proxy_enabled={meta.get('proxy_enabled')} "
+                f"proxy_mode={meta.get('proxy_mode')} "
+                f"proxy_url={meta.get('proxy_url_masked', '')}"
+            ),
+            extra={"request_url": url, **meta},
+        )
+        try:
+            async with client as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.json()
+        finally:
+            if meta.get("proxy_mode") == "env_fallback":
+                old = meta.get("_old_all_proxy")
+                if old is None:
+                    os.environ.pop("ALL_PROXY", None)
+                else:
+                    os.environ["ALL_PROXY"] = old

@@ -3,6 +3,7 @@ import { useDashboardStore } from '../../stores/dashboard'
 import { ref, watch } from 'vue'
 import BasicConfig from './config/BasicConfig.vue'
 import FeaturesConfig from './config/FeaturesConfig.vue'
+import ProxyConfig from './config/ProxyConfig.vue'
 import VersionInfo from './config/VersionInfo.vue'
 import VertexConfig from './config/VertexConfig.vue'
 
@@ -12,6 +13,7 @@ const isExpanded = ref(true)
 // Refs for child components
 const basicConfigRef = ref(null)
 const featuresConfigRef = ref(null)
+const proxyConfigRef = ref(null)
 
 // Shared password and messaging
 const sharedPassword = ref('')
@@ -101,6 +103,17 @@ async function handleSaveAllConfigs() {
       // console.warn('FeaturesConfig ref or saveComponentConfigs method not available');
     }
 
+    if (proxyConfigRef.value && typeof proxyConfigRef.value.saveComponentConfigs === 'function') {
+      const result = await proxyConfigRef.value.saveComponentConfigs(sharedPassword.value)
+      if (result.success) {
+        successes.push(result.message)
+      } else {
+        errors.push(result.message)
+      }
+    } else {
+      // console.warn('ProxyConfig ref or saveComponentConfigs method not available');
+    }
+
     if (errors.length > 0) {
       overallErrorMsg.value = errors.join('; ')
     } 
@@ -170,6 +183,7 @@ async function handleSaveAllConfigs() {
         <div v-if="isExpanded" class="fold-content">
           <BasicConfig ref="basicConfigRef" />
           <FeaturesConfig ref="featuresConfigRef" />
+          <ProxyConfig ref="proxyConfigRef" />
 
 
           <!-- Shared Save Section -->

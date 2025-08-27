@@ -169,3 +169,13 @@ NONSTREAM_KEEPALIVE_ENABLED = os.environ.get(
 NONSTREAM_KEEPALIVE_INTERVAL = float(
     os.environ.get("NONSTREAM_KEEPALIVE_INTERVAL", "5.0")
 )
+# 代理配置（SOCKS5）
+PROXY_SOCKS5_ENABLED = os.environ.get("PROXY_SOCKS5_ENABLED", "false").lower() in [
+    "true",
+    "1",
+    "yes",
+]
+PROXY_SOCKS5_HOST = os.environ.get("PROXY_SOCKS5_HOST", "")
+PROXY_SOCKS5_PORT = int(os.environ.get("PROXY_SOCKS5_PORT", "0") or 0)
+PROXY_SOCKS5_USERNAME = os.environ.get("PROXY_SOCKS5_USERNAME", "")
+PROXY_SOCKS5_PASSWORD = os.environ.get("PROXY_SOCKS5_PASSWORD", "")

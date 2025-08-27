@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-httpx
+httpx[socks]>=0.28.1
 python-dotenv
 requests
 apscheduler

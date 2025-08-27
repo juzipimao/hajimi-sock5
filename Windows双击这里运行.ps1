@@ -24,6 +24,25 @@ function Write-Log {
     Write-Host $Message -ForegroundColor $Color
 }
 
+# 顶层错误捕获：任何未处理的终止错误都会在此暂停，防止闪退
+trap {
+    try { Write-Error "捕获未处理的错误: $($_.Exception.Message)" } catch {}
+    try { Stop-Transcript | Out-Null } catch {}
+    Pause-On-Exit "发生错误。按回车键关闭窗口..."
+    exit 1
+}
+
+# 失败时防闪退：暂停等待用户按回车
+function Pause-On-Exit {
+    param([string]$Message = "按回车键关闭窗口...")
+    try {
+        Write-Host $Message -ForegroundColor Yellow
+        Read-Host | Out-Null
+    } catch {
+        # ignore
+    }
+}
+
 # 测试网络延迟函数
 function Test-NetworkLatency {
     param(
@@ -96,6 +115,12 @@ Write-Log " 欢迎来到 Hajimi 自动安装程序 (PS版)" -Color Cyan
 Write-Log "===================================" -Color Cyan
 ""
 
+# 开启日志记录（忽略失败）
+try {
+    $Global:RunLog = Join-Path $ScriptRoot "run.log"
+    Start-Transcript -Path $Global:RunLog -Append -ErrorAction SilentlyContinue | Out-Null
+} catch { }
+
 # --- 加载 .env 环境变量文件 ---
 Write-Log "正在加载环境变量..."
 $envFile = Join-Path $ScriptRoot ".env"
@@ -117,6 +142,42 @@ if (Test-Path $envFile) {
     Write-Log "警告: 未找到 .env 文件。" -Color Yellow
 }
 ""
+
+# --- 构建前端（可选：检测到 Node.js 时自动执行） ---
+try {
+    $UiDir = Join-Path $ScriptRoot "hajimiUI"
+    if (Test-Path $UiDir) {
+        $nodeExists = Get-Command node -ErrorAction SilentlyContinue
+        $npmExists = Get-Command npm -ErrorAction SilentlyContinue
+        if ($null -ne $nodeExists -and $null -ne $npmExists) {
+            Write-Log "检测到 Node.js，准备构建前端..." -Color Cyan
+            Push-Location $UiDir
+            try {
+                if (Test-Path "package-lock.json") {
+                    Write-Log "  运行 npm ci..." -Color Gray
+                    npm ci --no-audit --no-fund
+                    if ($LASTEXITCODE -ne 0) { throw "npm ci 失败，退出码 $LASTEXITCODE" }
+                } else {
+                    Write-Log "  运行 npm install..." -Color Gray
+                    npm install --no-audit --no-fund
+                    if ($LASTEXITCODE -ne 0) { throw "npm install 失败，退出码 $LASTEXITCODE" }
+                }
+                Write-Log "  执行 npm run build:app..." -Color Gray
+                npm run build:app --silent
+                if ($LASTEXITCODE -ne 0) { throw "npm run build:app 失败，退出码 $LASTEXITCODE" }
+                Write-Log "前端构建完成！" -Color Green
+            } catch {
+                Write-Log "前端构建失败，将继续使用现有静态资源: $($_.Exception.Message)" -Color Yellow
+            } finally {
+                Pop-Location
+            }
+        } else {
+            Write-Log "未检测到 Node.js/npm，跳过前端构建，使用现有静态资源。" -Color Yellow
+        }
+    }
+} catch {
+    Write-Log "前端构建阶段发生意外错误：$($_.Exception.Message)" -Color Yellow
+}
 
 # --- Python 环境准备 ---
 $PythonVersion = "3.12.3"
@@ -182,6 +243,7 @@ if (Test-Path $PythonExe) {
         Write-Log "1. 检查网络连接" -Color Yellow
         Write-Log "2. 删除 python 文件夹后重试" -Color Yellow
         Write-Log "3. 手动下载 Python 并解压到 'python' 文件夹" -Color Yellow
+        Pause-On-Exit
         exit 1
     }
 }
@@ -223,6 +285,7 @@ if (-not (Test-Path $InstallFlagFile)) {
     } catch {
         Write-Error "依赖安装过程中发生错误: $($_.Exception.Message)"
         Write-Error "请检查 requirements.txt 文件是否正确，或尝试删除 'python' 文件夹后重试。"
+        Pause-On-Exit
         exit 1
     }
 } else {
@@ -246,8 +309,22 @@ try {
     }
     # 3. 使用 '&' 调用操作符直接执行该路径
     & $UvicornExe app.main:app --host 0.0.0.0 --port 7860
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        Write-Error "Uvicorn 退出，代码: $code"
+        Pause-On-Exit
+        exit $code
+    } else {
+        Write-Log "Uvicorn 已正常退出 (代码 0)。" -Color Yellow
+        Pause-On-Exit
+    }
 } catch {
     # 捕获所有可能的错误
     Write-Error "启动应用失败: $($_.Exception.Message)"
+    Pause-On-Exit
     exit 1
 }
+
+# 正常结束时也暂停，避免双击运行后直接关闭窗口
+try { Stop-Transcript | Out-Null } catch { }
+Pause-On-Exit "运行完成。按回车键关闭窗口..."

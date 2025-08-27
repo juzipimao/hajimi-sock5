@@ -23,6 +23,8 @@ from app.vertex.vertex_ai_init import (
     init_vertex_ai as re_init_vertex_ai_function,
     reset_global_fallback_client,
 )
+import httpx
+import os
 
 # 创建路由器
 dashboard_router = APIRouter(prefix="/api", tags=["dashboard"])
@@ -205,6 +207,12 @@ async def get_dashboard_data():
         "max_retry_num": settings.MAX_RETRY_NUM,
         # 添加空响应重试次数限制
         "max_empty_responses": settings.MAX_EMPTY_RESPONSES,
+        # SOCKS5 代理配置（不返回敏感密码，仅状态）
+        "proxy_socks5_enabled": settings.PROXY_SOCKS5_ENABLED,
+        "proxy_socks5_host": settings.PROXY_SOCKS5_HOST,
+        "proxy_socks5_port": settings.PROXY_SOCKS5_PORT,
+        "proxy_socks5_username": settings.PROXY_SOCKS5_USERNAME,
+        "proxy_socks5_password_set": bool(settings.PROXY_SOCKS5_PASSWORD),
     }
 
 
@@ -681,6 +689,109 @@ async def update_config(config_data: dict):
                 log("info", f"空响应重试次数已更新为：{value}")
             except ValueError as e:
                 raise HTTPException(status_code=422, detail=f"参数类型错误：{str(e)}")
+
+        # ---- SOCKS5 代理配置 ----
+        elif config_key == "proxy_socks5_enabled":
+            if not isinstance(config_value, bool):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为布尔值")
+
+            async def _test_proxy_connectivity():
+                host = (settings.PROXY_SOCKS5_HOST or '').strip()
+                port = int(settings.PROXY_SOCKS5_PORT or 0)
+                user = (settings.PROXY_SOCKS5_USERNAME or '').strip()
+                pwd = (settings.PROXY_SOCKS5_PASSWORD or '')
+                if not host or port <= 0:
+                    raise HTTPException(status_code=400, detail="请先填写有效的代理主机与端口")
+                auth = f"{user}:{pwd}@" if user or pwd else ""
+                proxy_url = f"socks5://{auth}{host}:{port}"
+                # 脱敏后的代理URL（隐藏密码）
+                if user:
+                    masked_proxy_url = f"socks5://{user}:******@{host}:{port}"
+                else:
+                    masked_proxy_url = f"socks5://{host}:{port}"
+
+                test_url = "https://generativelanguage.googleapis.com/v1beta/models?key=invalid"
+                timeout = httpx.Timeout(8.0)
+                extra = {"proxy_host": host, "proxy_port": port, "proxy_url": masked_proxy_url, "request_url": test_url}
+                log("info", "开始测试SOCKS5代理可用性", extra=extra)
+
+                # 先尝试直接使用 proxies 形参
+                try:
+                    async with httpx.AsyncClient(proxies={"all": proxy_url}, timeout=timeout) as client:
+                        resp = await client.get(test_url)
+                        body = None
+                        try:
+                            body = resp.text
+                        except Exception:
+                            body = "<no text>"
+                        log("info", f"代理连通性测试得到响应，HTTP {resp.status_code}", extra={**extra, "response_body": body})
+                        # 任何能返回响应的情况都视为连通，哪怕是 401/403/400
+                        return True
+                except TypeError:
+                    # 当前 httpx 不支持 proxies 形参，尝试用环境变量退回
+                    try:
+                        old_all = os.environ.get("ALL_PROXY")
+                        os.environ["ALL_PROXY"] = proxy_url
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            resp = await client.get(test_url)
+                            body = None
+                            try:
+                                body = resp.text
+                            except Exception:
+                                body = "<no text>"
+                            log("info", f"代理连通性测试得到响应(环境变量)，HTTP {resp.status_code}", extra={**extra, "response_body": body})
+                            return True
+                    except Exception as e:
+                        log("error", f"代理连通性测试失败(环境变量)：{e}", extra=extra)
+                        return False
+                    finally:
+                        # 恢复 ALL_PROXY 避免影响其他流程
+                        if old_all is None:
+                            os.environ.pop("ALL_PROXY", None)
+                        else:
+                            os.environ["ALL_PROXY"] = old_all
+                except Exception as e:
+                    log("error", f"代理连通性测试失败：{e}", extra=extra)
+                    return False
+
+            if config_value is True:
+                ok = await _test_proxy_connectivity()
+                if not ok:
+                    raise HTTPException(status_code=400, detail="SOCKS5代理测试失败，请检查网络、主机端口或账号密码")
+                settings.PROXY_SOCKS5_ENABLED = True
+                log("info", "SOCKS5代理已启用（测试通过）")
+            else:
+                settings.PROXY_SOCKS5_ENABLED = False
+                log("info", "SOCKS5代理已关闭")
+
+        elif config_key == "proxy_socks5_host":
+            if not isinstance(config_value, str):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为字符串")
+            settings.PROXY_SOCKS5_HOST = config_value.strip()
+            log("info", "SOCKS5代理主机已更新")
+
+        elif config_key == "proxy_socks5_port":
+            try:
+                value = int(config_value)
+                if value < 0 or value > 65535:
+                    raise ValueError("端口必须在 0-65535 之间")
+                settings.PROXY_SOCKS5_PORT = value
+                log("info", f"SOCKS5代理端口已更新为：{value}")
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=f"参数类型错误：{str(e)}")
+
+        elif config_key == "proxy_socks5_username":
+            if not isinstance(config_value, str):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为字符串")
+            settings.PROXY_SOCKS5_USERNAME = config_value
+            log("info", "SOCKS5代理用户名已更新")
+
+        elif config_key == "proxy_socks5_password":
+            if not isinstance(config_value, str):
+                raise HTTPException(status_code=422, detail="参数类型错误：应为字符串")
+            settings.PROXY_SOCKS5_PASSWORD = config_value
+            # 不记录敏感内容
+            log("info", "SOCKS5代理密码已更新")
 
         else:
             raise HTTPException(status_code=400, detail=f"不支持的配置项：{config_key}")

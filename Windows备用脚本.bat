@@ -77,4 +77,10 @@ if not exist "%~dp0.venv" (
 echo Starting Hajimi application...
 uvicorn app.main:app --host 0.0.0.0 --port 7860
 
+echo.
+echo ============ Finished ============
+echo If the window closes too fast, run this BAT in an existing CMD.
+echo Press any key to exit...
+pause > nul
+
 endlocal

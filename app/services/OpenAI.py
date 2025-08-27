@@ -32,6 +32,53 @@ class OpenAIClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
+    def _build_socks5_proxy_url(self) -> str | None:
+        if not settings.PROXY_SOCKS5_ENABLED:
+            return None
+        host = (settings.PROXY_SOCKS5_HOST or '').strip()
+        port = int(settings.PROXY_SOCKS5_PORT or 0)
+        if not host or port <= 0:
+            return None
+        user = (settings.PROXY_SOCKS5_USERNAME or '').strip()
+        pwd = (settings.PROXY_SOCKS5_PASSWORD or '')
+        if user and pwd:
+            auth = f"{user}:{pwd}@"
+        elif user and not pwd:
+            auth = f"{user}:@"
+        else:
+            auth = ""
+        return f"socks5h://{auth}{host}:{port}"
+
+    def _create_async_client(self):
+        proxy_url = self._build_socks5_proxy_url()
+        def _mask(url: str) -> str:
+            try:
+                if '://' in url and '@' in url:
+                    scheme, rest = url.split('://', 1)
+                    cred_host = rest.split('@', 1)
+                    if len(cred_host) == 2:
+                        userpass, hostpart = cred_host
+                        user = userpass.split(':', 1)[0]
+                        return f"{scheme}://{user}:******@{hostpart}"
+            except Exception:
+                pass
+            return url
+
+        if proxy_url:
+            try:
+                client = httpx.AsyncClient(proxies={"all": proxy_url}, trust_env=False)
+                meta = {"proxy_enabled": True, "proxy_mode": "proxies_param", "proxy_url_masked": _mask(proxy_url)}
+                return client, meta
+            except TypeError:
+                old_all = os.environ.get("ALL_PROXY")
+                os.environ["ALL_PROXY"] = proxy_url
+                client = httpx.AsyncClient(trust_env=True)
+                meta = {"proxy_enabled": True, "proxy_mode": "env_fallback", "proxy_url_masked": _mask(proxy_url), "_old_all_proxy": old_all}
+                return client, meta
+        client = httpx.AsyncClient(trust_env=False)
+        meta = {"proxy_enabled": False, "proxy_mode": "disabled"}
+        return client, meta
+
     def filter_data_by_whitelist(data, allowed_keys):
         """
         根据白名单过滤字典。
@@ -90,11 +137,14 @@ class OpenAIClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST", url, headers=headers, json=data, timeout=600
-            ) as response:
-                buffer = b""  # 用于累积可能不完整的 JSON 数据
+        client, meta = self._create_async_client()
+        log("info", "准备发起OpenAI兼容流式请求", extra={"request_url": url, **meta})
+        try:
+            async with client as client:
+                async with client.stream(
+                    "POST", url, headers=headers, json=data, timeout=600
+                ) as response:
+                 buffer = b""  # 用于累积可能不完整的 JSON 数据
                 try:
                     async for line in response.aiter_lines():
                         if not line.strip():  # 跳过空行 (SSE 消息分隔符)
@@ -133,3 +183,10 @@ class OpenAIClient:
                     raise e
                 finally:
                     log("info", "流式请求结束")
+        finally:
+            if meta.get("proxy_mode") == "env_fallback":
+                old = meta.get("_old_all_proxy")
+                if old is None:
+                    os.environ.pop("ALL_PROXY", None)
+                else:
+                    os.environ["ALL_PROXY"] = old

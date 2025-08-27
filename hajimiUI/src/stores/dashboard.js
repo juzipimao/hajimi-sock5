@@ -34,6 +34,13 @@ export const useDashboardStore = defineStore('dashboard', () => {
     maxRetryNum: 0,
     searchPrompt: '',
     maxEmptyResponses: 0
+    ,
+    // SOCKS5 代理
+    proxySocks5Enabled: false,
+    proxySocks5Host: '',
+    proxySocks5Port: 0,
+    proxySocks5Username: '',
+    proxySocks5PasswordSet: false
   })
 
   const apiKeyStats = ref([])
@@ -130,6 +137,13 @@ export const useDashboardStore = defineStore('dashboard', () => {
       googleCredentialsJson: data.google_credentials_json || false,
       maxRetryNum: data.max_retry_num || 0,
       maxEmptyResponses: data.max_empty_responses || 0
+      ,
+      // SOCKS5 代理（密码不下发，仅状态）
+      proxySocks5Enabled: data.proxy_socks5_enabled || false,
+      proxySocks5Host: data.proxy_socks5_host || '',
+      proxySocks5Port: data.proxy_socks5_port || 0,
+      proxySocks5Username: data.proxy_socks5_username || '',
+      proxySocks5PasswordSet: data.proxy_socks5_password_set || false
     }
 
     // 更新API密钥统计

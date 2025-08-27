@@ -4,7 +4,7 @@ import os
 import logging
 import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
-from app.utils.logging import format_log_message
+from app.utils.logging import format_log_message, log
 import app.config.settings as settings
 
 logger = logging.getLogger("my_logger")
@@ -82,14 +82,34 @@ async def test_api_key(api_key: str) -> bool:
     测试 API 密钥是否有效。
     """
     try:
-        import httpx
-
+        from app.services.gemini import GeminiClient
         url = "https://generativelanguage.googleapis.com/v1beta/models?key={}".format(
             api_key
         )
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return True
+        # 复用 GeminiClient 的代理创建逻辑，确保与正式请求一致
+        _inst = GeminiClient("")
+        client, meta = _inst._create_async_client()
+        log(
+            "info",
+            (
+                f"测试API Key请求 request_url={url} "
+                f"proxy_enabled={meta.get('proxy_enabled')} "
+                f"proxy_mode={meta.get('proxy_mode')} "
+                f"proxy_url={meta.get('proxy_url_masked', '')}"
+            ),
+            extra={"request_url": url, **meta},
+        )
+        try:
+            async with client as client:
+                response = await client.get(url, timeout=30)
+                response.raise_for_status()
+                return True
+        finally:
+            if meta.get("proxy_mode") == "env_fallback":
+                old = meta.get("_old_all_proxy")
+                if old is None:
+                    os.environ.pop("ALL_PROXY", None)
+                else:
+                    os.environ["ALL_PROXY"] = old
     except Exception:
         return False
