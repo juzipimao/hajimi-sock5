@@ -703,21 +703,30 @@ async def update_config(config_data: dict):
                 if not host or port <= 0:
                     raise HTTPException(status_code=400, detail="请先填写有效的代理主机与端口")
                 auth = f"{user}:{pwd}@" if user or pwd else ""
-                proxy_url = f"socks5://{auth}{host}:{port}"
+                # 使用 socks5h 确保 DNS 走代理端
+                proxy_url = f"socks5h://{auth}{host}:{port}"
                 # 脱敏后的代理URL（隐藏密码）
                 if user:
-                    masked_proxy_url = f"socks5://{user}:******@{host}:{port}"
+                    masked_proxy_url = f"socks5h://{user}:******@{host}:{port}"
                 else:
-                    masked_proxy_url = f"socks5://{host}:{port}"
+                    masked_proxy_url = f"socks5h://{host}:{port}"
 
                 test_url = "https://generativelanguage.googleapis.com/v1beta/models?key=invalid"
                 timeout = httpx.Timeout(8.0)
                 extra = {"proxy_host": host, "proxy_port": port, "proxy_url": masked_proxy_url, "request_url": test_url}
                 log("info", "开始测试SOCKS5代理可用性", extra=extra)
 
-                # 先尝试直接使用 proxies 形参
+                # 先尝试直接使用 proxies 形参（标准键），禁用环境代理干扰
                 try:
-                    async with httpx.AsyncClient(proxies={"all": proxy_url}, timeout=timeout) as client:
+                    async with httpx.AsyncClient(
+                        proxies={
+                            "all://": proxy_url,
+                            "http://": proxy_url,
+                            "https://": proxy_url,
+                        },
+                        timeout=timeout,
+                        trust_env=False,
+                    ) as client:
                         resp = await client.get(test_url)
                         body = None
                         try:
@@ -728,11 +737,19 @@ async def update_config(config_data: dict):
                         # 任何能返回响应的情况都视为连通，哪怕是 401/403/400
                         return True
                 except TypeError:
-                    # 当前 httpx 不支持 proxies 形参，尝试用环境变量退回
+                    # 当前 httpx 不支持 proxies 形参，尝试用环境变量退回（覆盖全部相关变量）
                     try:
-                        old_all = os.environ.get("ALL_PROXY")
+                        old_env = {
+                            "ALL_PROXY": os.environ.get("ALL_PROXY"),
+                            "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+                            "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+                            "NO_PROXY": os.environ.get("NO_PROXY"),
+                        }
                         os.environ["ALL_PROXY"] = proxy_url
-                        async with httpx.AsyncClient(timeout=timeout) as client:
+                        os.environ["HTTP_PROXY"] = proxy_url
+                        os.environ["HTTPS_PROXY"] = proxy_url
+                        os.environ.pop("NO_PROXY", None)
+                        async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
                             resp = await client.get(test_url)
                             body = None
                             try:
@@ -745,11 +762,17 @@ async def update_config(config_data: dict):
                         log("error", f"代理连通性测试失败(环境变量)：{e}", extra=extra)
                         return False
                     finally:
-                        # 恢复 ALL_PROXY 避免影响其他流程
-                        if old_all is None:
-                            os.environ.pop("ALL_PROXY", None)
+                        # 恢复环境变量
+                        for k in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY"):
+                            v = old_env.get(k)
+                            if v is None:
+                                os.environ.pop(k, None)
+                            else:
+                                os.environ[k] = v
+                        if old_env.get("NO_PROXY") is None:
+                            os.environ.pop("NO_PROXY", None)
                         else:
-                            os.environ["ALL_PROXY"] = old_all
+                            os.environ["NO_PROXY"] = old_env.get("NO_PROXY")
                 except Exception as e:
                     log("error", f"代理连通性测试失败：{e}", extra=extra)
                     return False
